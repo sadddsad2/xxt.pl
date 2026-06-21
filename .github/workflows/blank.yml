@@ -2,13 +2,25 @@ name: EpicHost Keepalive
 
 on:
   schedule:
-    - cron: '0 */1 * * *'
+    - cron: '0 * * * *'   # 每小时一次,UTC时间
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Random delay
+        run: |
+          DELAY=$(( (RANDOM % 300) + 60 ))  # 60~300秒 = 1~5分钟
+          echo "随机等待 ${DELAY} 秒后开始执行..."
+          sleep "$DELAY"
+
       - name: Renew servers
         env:
           BASE_URLS: ${{ secrets.EPICHOST_BASE_URLS }}
@@ -16,7 +28,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 检查 jq
           if ! command -v jq &> /dev/null; then
             sudo apt-get install -y jq
           fi
@@ -30,6 +41,7 @@ jobs:
           fi
 
           FAIL=0
+          REPORT=""
 
           for i in $(seq 0 $((URL_COUNT - 1))); do
             URL=$(echo "$BASE_URLS" | jq -r ".[$i]")
@@ -38,6 +50,8 @@ jobs:
             echo "===== [$((i+1))/$URL_COUNT] 续期: $URL ====="
 
             SUCCESS=0
+            LAST_DETAIL=""
+
             for retry in 1 2 3; do
               echo "尝试第 $retry 次..."
 
@@ -52,6 +66,19 @@ jobs:
               cat /tmp/resp_$i.json || true
               echo ""
 
+              # 提取 detail 字段(成功响应通常没有 errors,失败响应有 errors[0].detail)
+              DETAIL=$(jq -r '
+                if .errors then
+                  (.errors[0].detail // "未知错误")
+                elif .message then
+                  .message
+                else
+                  "续期成功"
+                end
+              ' /tmp/resp_$i.json 2>/dev/null || echo "无法解析响应")
+
+              LAST_DETAIL="$DETAIL"
+
               if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
                 echo "续期成功"
                 SUCCESS=1
@@ -62,17 +89,66 @@ jobs:
               sleep 10
             done
 
-            if [ "$SUCCESS" -eq 0 ]; then
-              echo "服务器 $URL 多次重试后仍失败"
+            if [ "$SUCCESS" -eq 1 ]; then
+              REPORT="${REPORT}✅ [$((i+1))] ${URL}
+状态: 成功
+详情: ${LAST_DETAIL}
+
+"
+            else
+              REPORT="${REPORT}❌ [$((i+1))] ${URL}
+状态: 失败
+详情: ${LAST_DETAIL}
+
+"
               FAIL=1
             fi
 
-            echo ""
           done
 
-          if [ "$FAIL" -eq 1 ]; then
-            echo "存在续期失败的服务器"
-            exit 1
-          fi
+          echo "RUN_FAIL=$FAIL" >> "$GITHUB_ENV"
 
-          echo "全部续期成功"
+          # 保存报告供下一步使用(多行内容用 EOF 分隔)
+          {
+            echo "REPORT<<EOF"
+            echo "$REPORT"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Send Telegram notification
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS_TEXT=$([ "$RUN_FAIL" = "1" ] && echo "⚠️ 部分/全部续期失败" || echo "✅ 全部续期成功")
+          NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          MSG="EpicHost 保活通知
+时间: ${NOW}
+总体状态: ${STATUS_TEXT}
+
+${REPORT}"
+
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode text="${MSG}"
+
+      - name: Update time.txt
+        run: |
+          echo "Last run: $(date -u '+%Y-%m-%d %H:%M:%S') UTC" > time.txt
+          echo "Status: $([ "$RUN_FAIL" = "1" ] && echo FAILED || echo SUCCESS)" >> time.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add time.txt
+          git diff --staged --quiet || git commit -m "chore: update time.txt [skip ci]"
+          git push
+
+      - name: Fail job if any server failed
+        if: env.RUN_FAIL == '1'
+        run: |
+          echo "存在续期失败的服务器"
+          exit 1
